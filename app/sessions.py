@@ -54,6 +54,23 @@ sets, malformed expressions and query-budget overruns reject before
 anything is written; a zero-hit query is a success that stores no
 operation, bumps no revision and appends no boundary.
 
+A session may pin up to ``PROTECTED_PATHS_LIMIT`` distinct, valid
+RFC 6901 JSON Pointers at creation.  The rule is part of the durable
+record, immutable for the session's whole lifetime and shared with every
+process reading the directory; records written before the feature exist
+read the empty rule.  Both commit paths compare every protected
+location's resolved value between the locked revision's document and the
+would-be document *inside the critical section*, before the record is
+mutated or persisted: a set changing the value (explicit ``null`` vs
+missing included; booleans never equal numbers), an ancestor subtree
+replacement, an array insert/delete shifting a protected index, or any
+visible change under a protected root rejects the whole request as
+``ProtectedPathError`` (HTTP 422) -- no log entry, revision bump, history
+boundary or legacy-origin migration is written.  Writing the protected
+location with its current value still stores the operation and bumps
+the revision, and exact retransmissions and zero-hit replacements keep
+their no-op behavior; the stale-revision check (409) runs first.
+
 Sessions are persisted as one JSON file per session inside a directory
 (``SESSION_STORE_DIR`` env var, default ``.sessions``), so they remain
 readable after the service (or ``docker compose``) restarts.  The lock
@@ -80,6 +97,7 @@ from .engine import merge_logs, parse_pointer, validate_and_dedupe
 from .models import Operation, Subscription
 from .query import QueryValidationError, execute, parse_path
 from .routing import (
+    _json_equal,
     compile_subscriptions,
     diff_events,
     route_events,
@@ -92,6 +110,9 @@ CHANGES_PAGE_SIZE = 20
 
 #: Maximum number of nodes one POST .../replace query may match.
 REPLACE_MATCH_LIMIT = 20
+
+#: Maximum number of distinct protected JSON Pointers per session.
+PROTECTED_PATHS_LIMIT = 20
 
 
 class SessionNotFoundError(KeyError):
@@ -108,6 +129,145 @@ class CursorOutOfRangeError(ValueError):
 
 class ReplaceValidationError(ValueError):
     """Raised when a JSONPath replace batch is malformed or unsafe."""
+
+
+class ProtectedPathValidationError(ValueError):
+    """Raised when a session's protected-pointer rule is malformed."""
+
+
+class ProtectedPathError(ValueError):
+    """Raised when a commit would change one of a session's protected paths."""
+
+
+_MISSING = object()
+
+# RFC 6901 array reference token: "0" or a non-zero-leading decimal run
+# (the one-after-the-end "-" token is never resolved here, so it simply
+# fails to address a node rather than failing pointer validation).
+_ARRAY_INDEX_RE = re.compile(r"0|[1-9][0-9]*\Z")
+
+
+def _parse_strict_pointer(pointer: str) -> list[str]:
+    """Parse an RFC 6901 pointer, rejecting illegal ``~`` escapes.
+
+    The merge engine's own pointer parser is deliberately permissive
+    (operations are already valid for the merge once they reach it); the
+    protected-pointer rule is user input and is held to the same strict
+    unescape standard as ``POST /resolve`` references: a ``~`` must be
+    followed by ``0`` or ``1``.
+    """
+    if pointer == "":
+        return []
+    if not pointer.startswith("/"):
+        raise ValueError(
+            f"path must be a JSON Pointer starting with '/' (got {pointer!r})"
+        )
+    tokens: list[str] = []
+    for raw in pointer.split("/")[1:]:
+        out: list[str] = []
+        i = 0
+        while i < len(raw):
+            ch = raw[i]
+            if ch == "~":
+                if i + 1 >= len(raw) or raw[i + 1] not in "01":
+                    raise ValueError(
+                        f"'~' must be followed by '0' or '1' in {pointer!r}"
+                    )
+                out.append("~" if raw[i + 1] == "0" else "/")
+                i += 2
+            else:
+                out.append(ch)
+                i += 1
+        tokens.append("".join(out))
+    return tokens
+
+
+def validate_protected_paths(paths: Any) -> list[str]:
+    """Validate the protected-pointer rule of a create-session request.
+
+    The rule may hold at most ``PROTECTED_PATHS_LIMIT`` distinct, valid
+    RFC 6901 JSON Pointers (``""`` is the document root).  Structural
+    limits (list length, element type) are normally enforced by the
+    Pydantic request model as well; re-checking them here keeps
+    ``SessionStore.create`` authoritative for any caller.
+    """
+    if not isinstance(paths, list):
+        raise ProtectedPathValidationError("protected_paths must be a list")
+    if len(paths) > PROTECTED_PATHS_LIMIT:
+        raise ProtectedPathValidationError(
+            f"at most {PROTECTED_PATHS_LIMIT} protected paths are allowed "
+            f"per session (got {len(paths)})"
+        )
+    seen: set[str] = set()
+    for path in paths:
+        if not isinstance(path, str):
+            raise ProtectedPathValidationError(
+                f"protected paths must be JSON Pointer strings (got {path!r})"
+            )
+        try:
+            _parse_strict_pointer(path)
+        except ValueError as exc:
+            raise ProtectedPathValidationError(
+                f"invalid protected JSON Pointer {path!r}: {exc}"
+            ) from exc
+        if path in seen:
+            raise ProtectedPathValidationError(
+                f"protected JSON Pointer {path!r} is listed more than once"
+            )
+        seen.add(path)
+    return list(paths)
+
+
+def _pointer_value(document: Any, pointer: str) -> Any:
+    """Resolve an RFC 6901 pointer against a document.
+
+    Returns the ``_MISSING`` sentinel (never a stored value) when any
+    segment cannot be traversed -- including traversal through a scalar,
+    a missing object member or an out-of-range (or ``-``) array index.
+    An explicit JSON ``null`` therefore stays distinguishable from a
+    missing location.
+    """
+    node: Any = document
+    for tok in _parse_strict_pointer(pointer):
+        if isinstance(node, dict):
+            if tok not in node:
+                return _MISSING
+            node = node[tok]
+        elif isinstance(node, list):
+            if not _ARRAY_INDEX_RE.fullmatch(tok) or int(tok) >= len(node):
+                return _MISSING
+            node = node[int(tok)]
+        else:
+            return _MISSING
+    return node
+
+
+def _check_protected_paths(
+    protected_paths: list[str], before: Any, after: Any
+) -> None:
+    """Reject a commit changing any protected location's resolved value.
+
+    Locations are compared pairwise on the pre/post documents, so an
+    ancestor replacement, an array insert/delete shifting indices or a
+    type swap at the pointer all surface as a change.  Missing and
+    present values always differ (missing vs explicit ``null`` included),
+    a location missing on both sides is unchanged, and booleans never
+    compare equal to numbers.
+    """
+    for pointer in protected_paths:
+        old = _pointer_value(before, pointer)
+        new = _pointer_value(after, pointer)
+        if (old is _MISSING) != (new is _MISSING):
+            changed = True
+        elif old is _MISSING:
+            changed = False  # absent before and after
+        else:
+            changed = not _json_equal(old, new)
+        if changed:
+            label = "the document root" if pointer == "" else pointer
+            raise ProtectedPathError(
+                f"the operation changes protected JSON Pointer {label}"
+            )
 
 
 def _reject_nested_pointers(session_id: str, pointers: list[str]) -> None:
@@ -164,7 +324,9 @@ class SessionRecord:
     (boundaries), starting at the history origin -- revision 0 for new
     sessions, the then-current revision for records created before this
     feature existed.  ``history is None`` marks a not-yet-migrated legacy
-    record.
+    record.  ``protected_paths`` is the immutable protected-pointer rule
+    pinned at creation; records written before that feature existed have
+    none and read back as an empty rule.
     """
 
     session_id: str
@@ -173,6 +335,7 @@ class SessionRecord:
     version: dict[str, int]
     log: list[Operation] = field(default_factory=list)
     history: list[_Boundary] | None = None
+    protected_paths: list[str] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -188,6 +351,10 @@ class SessionRecord:
                 if self.history is not None
                 else {}
             ),
+            # The rule is written explicitly even when empty so a restarted
+            # process (and a second process sharing the directory) observes
+            # the same empty rule rather than guessing from its absence.
+            "protected_paths": list(self.protected_paths),
         }
 
     @classmethod
@@ -198,6 +365,10 @@ class SessionRecord:
             if raw_history is not None
             else None
         )
+        # Sessions written before protected paths existed read the empty
+        # rule -- every commit keeps working exactly as before.
+        raw_protected = data.get("protected_paths", [])
+        protected_paths = list(raw_protected) if raw_protected else []
         return cls(
             session_id=data["session_id"],
             revision=int(data["revision"]),
@@ -205,6 +376,7 @@ class SessionRecord:
             version={k: int(v) for k, v in data["version"].items()},
             log=[Operation.model_validate(o) for o in data["log"]],
             history=history,
+            protected_paths=protected_paths,
         )
 
 
@@ -324,10 +496,22 @@ class SessionStore:
         rec.history = [_Boundary(rec.revision, origin)]
         return True
 
-    def create(self, document: Any, version: dict[str, int]) -> SessionRecord:
-        """Create a session pinned to ``document``/``version`` at revision 0."""
+    def create(
+        self,
+        document: Any,
+        version: dict[str, int],
+        protected_paths: list[str] | None = None,
+    ) -> SessionRecord:
+        """Create a session pinned to ``document``/``version`` at revision 0.
+
+        ``protected_paths`` is validated here (distinct, valid RFC 6901
+        pointers, at most ``PROTECTED_PATHS_LIMIT``) and then frozen for
+        the session's lifetime: it is persisted with the record and no API
+        ever mutates it.
+        """
         initial_version = dict(version or {})
         validate_and_dedupe([], initial_version)  # rejects negative entries
+        rule = validate_protected_paths(protected_paths or [])
         rec = SessionRecord(
             session_id=uuid.uuid4().hex,
             revision=0,
@@ -336,6 +520,7 @@ class SessionStore:
             # Revision 0 is the history origin: its boundary is the pinned
             # initial document and no event can ever point before it.
             history=[_Boundary(0, deepcopy(document))],
+            protected_paths=rule,
         )
         with self._lock:
             self._persist(rec)
@@ -367,6 +552,7 @@ class SessionStore:
             "version": result["version"],
             "conflicts": result["conflicts"],
             "tombstones": result["tombstones"],
+            "protected_paths": list(rec.protected_paths),
         }
 
     def _migrate_legacy(self, session_id: str) -> SessionRecord:
@@ -405,6 +591,12 @@ class SessionStore:
         session's cross-process lock, so two processes sharing the store
         directory cannot both commit on top of the same revision, and the
         new revision's boundary is durable together with the revision.
+
+        When the session pins protected JSON Pointers, each pinned
+        location's resolved value on the locked revision's document and
+        the would-be document are compared inside the same section; a
+        difference rejects the whole batch (422) before any mutation or
+        persist step.
         """
         if not _SESSION_ID_RE.fullmatch(session_id):
             raise SessionNotFoundError(session_id)
@@ -437,9 +629,20 @@ class SessionStore:
             # a validation or execution failure raises before anything is
             # written, so the session keeps its previous revision and log
             # and the legacy origin is also not persisted.
-            new_document = merge_logs(rec.document, rec.version, [unique_ops])[
-                "document"
-            ]
+            merge_result = merge_logs(rec.document, rec.version, [unique_ops])
+            new_document = merge_result["document"]
+            # Protected-pointer guard: compare every pinned location
+            # between the locked revision's document and the would-be
+            # document.  A rejection raises before rec is mutated or
+            # persisted, so no log, revision, boundary or migration write
+            # survives it.
+            if rec.protected_paths:
+                current_document = merge_logs(rec.document, rec.version, [rec.log])[
+                    "document"
+                ]
+                _check_protected_paths(
+                    rec.protected_paths, current_document, new_document
+                )
             rec.log = unique_ops
             rec.revision += 1
             # Immutable boundary: later batches never rewrite this entry,
@@ -476,6 +679,10 @@ class SessionStore:
         persist steps as :meth:`submit_batch` -- another process committing
         the same revision first turns this request into a ``409`` and paths
         selected from a stale document can never be written to a newer one.
+        The same protected-pointer comparison as :meth:`submit_batch` runs
+        in the locked section: a generated run that would change a pinned
+        location rejects wholesale (422) without persisting anything; a
+        zero-hit query reaches no such check and stays a no-op success.
         """
         if not _SESSION_ID_RE.fullmatch(session_id):
             raise SessionNotFoundError(session_id)
@@ -543,6 +750,15 @@ class SessionStore:
             new_document = merge_logs(rec.document, rec.version, [unique_ops])[
                 "document"
             ]
+            # Same protected-pointer guard as submit_batch: every pinned
+            # location must keep its resolved value.  An ancestor match is
+            # already rejected by the parent/child match-set rule, and this
+            # additionally catches a sibling subtree replacement or an
+            # array insert/delete that shifts a protected position.
+            if rec.protected_paths:
+                _check_protected_paths(
+                    rec.protected_paths, current_document, new_document
+                )
             rec.log = unique_ops
             rec.revision += 1
             rec.history.append(_Boundary(rec.revision, new_document))

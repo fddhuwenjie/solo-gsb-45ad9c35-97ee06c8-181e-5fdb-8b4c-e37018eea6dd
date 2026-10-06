@@ -31,6 +31,8 @@ from .resolve import ResolveValidationError, resolve_documents
 from .routing import RoutingValidationError, route_changes
 from .sessions import (
     CursorOutOfRangeError,
+    ProtectedPathError,
+    ProtectedPathValidationError,
     ReplaceValidationError,
     RevisionConflictError,
     SessionNotFoundError,
@@ -39,7 +41,7 @@ from .sessions import (
 
 app = FastAPI(
     title="Offline JSON Merge API",
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "Concurrent, offline-first merging of JSON document operation logs "
         "using vector clocks, deterministic (actor, seq) arbitration, "
@@ -54,7 +56,11 @@ app = FastAPI(
         "POST /sessions/{session_id}/changes) that accumulate operation "
         "batches into one cumulative log re-merged from the initial "
         "document on every commit, and page the per-revision routed "
-        "change events after a caller-supplied revision cursor."
+        "change events after a caller-supplied revision cursor.  Sessions "
+        "may pin up to 20 immutable protected JSON Pointers at creation; "
+        "any batch or JSONPath replacement whose locked commit would "
+        "change one of those locations is rejected (422) without writing "
+        "a log entry, revision or history boundary."
     ),
 )
 
@@ -155,10 +161,18 @@ def create_session(req: SessionCreateRequest, request: Request) -> dict:
     """Create a session pinned to an initial document and version vector."""
     store = _session_store(request)
     try:
-        rec = store.create(req.document, req.version)
+        rec = store.create(
+            req.document, req.version, protected_paths=req.protected_paths
+        )
     except LogValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return {"session_id": rec.session_id, "revision": rec.revision}
+    except ProtectedPathValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "session_id": rec.session_id,
+        "revision": rec.revision,
+        "protected_paths": list(rec.protected_paths),
+    }
 
 
 @app.get("/sessions/{session_id}", response_model=SessionStateResponse)
@@ -187,6 +201,8 @@ def submit_batch(session_id: str, req: BatchRequest, request: Request) -> dict:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except LogValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ProtectedPathError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {
         "session_id": outcome.session_id,
         "revision": outcome.revision,
@@ -205,9 +221,10 @@ def replace_by_path(
     """Atomically set one value at every node a JSONPath matches.
 
     Selection on the current merged document, generated-operation
-    validation, the expected-revision check and persistence are one
-    cross-process commit: a stale revision yields 409 and a malformed,
-    over-budget or nested-path query yields 422, neither writing anything.
+    validation, the expected-revision check, protected-pointer
+    enforcement and persistence are one cross-process commit: a stale
+    revision yields 409 and a malformed, over-budget, nested-path or
+    protected-path-changing query yields 422, neither writing anything.
     """
     try:
         outcome = _session_store(request).replace_paths(
@@ -227,6 +244,8 @@ def replace_by_path(
         # ReplaceValidationError: malformed/over-budget/nested query.
         # LogValidationError: the generated set ops failed the ordinary
         # merge rules; nothing is persisted in either case.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ProtectedPathError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {
         "session_id": outcome.session_id,

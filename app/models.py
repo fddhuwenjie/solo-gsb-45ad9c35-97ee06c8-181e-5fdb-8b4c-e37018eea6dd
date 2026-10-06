@@ -287,6 +287,11 @@ class SessionCreateRequest(BaseModel):
 
     The session pins both for its whole lifetime; every accepted batch is
     re-merged from this initial state over the cumulative operation log.
+    ``protected_paths`` optionally pins up to 20 distinct JSON Pointers:
+    they are stored with the session, never change afterwards, and any
+    batch/replace commit whose resulting document would change one of the
+    protected locations is rejected wholesale (422) without writing
+    anything.
     """
 
     document: Any = None
@@ -294,11 +299,22 @@ class SessionCreateRequest(BaseModel):
         default_factory=dict,
         description="version vector of the initial document",
     )
+    protected_paths: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        description=(
+            "up to 20 distinct RFC 6901 JSON Pointers immutable for the "
+            "session's whole lifetime ('' is the document root)"
+        ),
+    )
 
 
 class SessionCreateResponse(BaseModel):
     session_id: str
     revision: int
+    protected_paths: list[str] = Field(
+        description="the protected JSON Pointers stored with the session"
+    )
 
 
 class BatchRequest(BaseModel):
@@ -337,6 +353,12 @@ class SessionStateResponse(BaseModel):
     version: dict[str, int]
     conflicts: list[Conflict]
     tombstones: list[str]
+    protected_paths: list[str] = Field(
+        description=(
+            "the protected JSON Pointers pinned at creation (empty for "
+            "sessions created before this feature)"
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
