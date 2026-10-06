@@ -25,7 +25,9 @@
   生成操作、检查修订并落盘）；`GET /sessions/{id}` 读取最新修订号、文档、
   版本向量、冲突与墓碑；`POST /sessions/{id}/changes` 传入已读修订号和
   1～100 条订阅，按修订顺序增量补读之后最多 20 次已提交修订各自的路由事件，
-  返回下次读取游标。每次提交都从初始文档重算累计日志（不把上次结果当作新
+  返回下次读取游标。创建会话时还可指定最多 20 条互不重复、创建后不可变的
+  **受保护 JSON Pointer 路径**，批次提交与 JSONPath 批量替换都会在锁内比较
+  受保护位置前后的值，任一变化整次提交返回 `422` 且不落盘。每次提交都从初始文档重算累计日志（不把上次结果当作新
   基线），每次提交的文档快照（历史边界）与修订号一同持久化，会话持久化到
   磁盘卷，重启后仍可读取、仍可接续分页。
 
@@ -585,7 +587,10 @@ curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
 已接收的累计日志**保存在服务端，副本可以分任意多批提交操作：
 
 - `POST /sessions`：创建会话，固定初始文档与初始版本向量，返回
-  `{"session_id", "revision": 0}`。
+  `{"session_id", "revision": 0, "protected_paths"}`。创建时可用
+  `protected_paths` 指定最多 **20 条互不重复**的受保护 JSON Pointer
+  （RFC 6901，`""` 为根）；规则随会话持久化、创建后不可变，非法指针、
+  重复项或超过 20 条返回 `422`，旧版本会话文件按空规则读取。
 - `POST /sessions/{session_id}/batches`：凭 `expected_revision` 提交一个
   **非空**操作批次。校验、重算与修订提交**原子**完成；响应
   `{"session_id", "revision", "accepted", "duplicates"}`。
@@ -595,7 +600,7 @@ curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
   按文档先序为该 actor 生成连续编号的 `set` 操作并按原有合并规则原子提交；
   响应 `{"session_id", "revision", "matched_paths", "operations"}`。
 - `GET /sessions/{session_id}`：读取最新修订号、文档、版本向量、冲突与
-  墓碑。
+  墓碑，以及该会话固定不变的 `protected_paths`。
 - `POST /sessions/{session_id}/changes`：传入 `after_revision`（已读修订号）
   与 1～100 条沿用 `/route-changes` 规则的订阅，按修订顺序返回该游标之后
   最多 20 次已提交修订，每条修订是该修订文档相对**前一修订**文档的路由
@@ -633,6 +638,17 @@ curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
   版本向量回退等）或执行失败（如对非数组 `insert`）返回 `422`；
   `expected_revision` 过期返回 `409`；会话不存在返回 `404`。这些失败
   都不会写入部分批次，会话保持原有修订与日志。
+- **受保护路径**：会话创建时固定的 `protected_paths`（最多 20 条、互不
+  重复、创建后不变，旧会话文件按空列表读取）在**当前修订的持锁提交**中
+  生效——`/batches` 与 `/replace` 都在锁内对受保护指针逐一比较操作前后
+  的值。比较按 JSON 语义区分类型：**位置缺失与显式 `null` 不同，布尔值
+  与数字不同**（`1 ≠ true`，但 `1 == 1.0`）；直接写入、删除自不必说，
+  **替换祖先子树或在数组中插入/删除导致受保护下标指向别的值**同样被
+  拦截。任一路径变化，整次提交返回 `422`，日志、修订号与历史边界都不
+  写入。受保护位置的值未变时操作照常提交——包括生成了新操作但可见文档
+  完全未变（例如把字段设成已有值）的情况，修订号照常递增。规则与会话
+  同文件持久化，多进程共享目录与服务重启后仍然生效；过期修订仍先返回
+  `409`，整批重传的幂等去重与零命中替换不触发比较、行为不变。
 - **JSONPath 批量替换**：`POST /sessions/{id}/replace` 在持锁期间对
   **期望修订**的合并文档求值（选词绝不会基于旧文档写到新修订），命中按
   文档先序转成该 actor 的连续 `set` 操作：首条 seq 接续该 actor 在初始
@@ -669,7 +685,8 @@ curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
 - 会话不做进程内缓存，`GET /sessions/{id}` 与增量补读总是反映磁盘上最新
   已提交的状态，任一进程都能立即读到成功批次、最新修订号并接续分页。
 - 重传幂等、非法批次 `422`、过期修订号 `409`、会话不存在 `404`、游标
-  越界 `422` 的语义与单进程完全一致，失败同样不落盘。
+  越界 `422` 的语义与单进程完全一致，失败同样不落盘；受保护路径的
+  前后值比较也在这把锁内完成，所以多进程下任何提交都不可能绕过规则。
 - 锁文件随会话保留（不删除，避免 unlink/reopen 竞态），数量与会话数
   相同；读取路径仅在需要为升级前会话建立历史起点时持锁落盘，其余时候
   靠原子替换保证不会读到写了一半的文件。
@@ -857,6 +874,82 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/sessions/$SID/re
 # => 409
 ```
 
+### 受保护 JSON Pointer 路径
+
+创建会话时用 `protected_paths` 固定最多 20 条互不重复的 JSON Pointer
+（RFC 6901，`""` 表示文档根）。规则随会话持久化、创建后不可变，
+`GET /sessions/{id}` 始终返回这份规则；旧版本写出的会话文件没有该字段，
+按空规则读取。此后每次 `/batches` 与 `/replace` 都在**当前修订的持锁
+提交**里比较每个受保护指针操作前后的值：缺失与 `null`、布尔值与数字都
+算不同，祖先替换或数组插入使受保护位置指向新值同样拦截。任一变化整次
+提交返回 `422`，日志、修订号、历史边界一律不写；受保护位置未变时操作
+照常提交（含“生成了新操作但可见文档未变”的情形）。
+
+创建带规则的会话（非法指针、重复项或超过 20 条返回 `422`）：
+
+```bash
+curl -s -X POST localhost:8000/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "document": {"title": "draft", "items": ["x", "y"], "locked": 1},
+    "version": {},
+    "protected_paths": ["/title", "/items/1", "/locked"]
+  }'
+# => {"session_id":"...","revision":0,"protected_paths":["/title","/items/1","/locked"]}
+```
+
+被保护规则拒绝的批次（`/batches`，422 且无任何落盘）：
+
+```bash
+# 直接改受保护字段
+curl -s -w '\nHTTP %{http_code}\n' -X POST localhost:8000/sessions/$SID/batches \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 0,
+       "operations": [{"actor":"alice","seq":1,"version":{"alice":1},
+                       "path":"/title","action":"set","value":"new"}]}'
+# => {"detail":"commit rejected: protected JSON Pointer '/title' changed"}
+# => HTTP 422
+
+# 在数组头部插入，受保护下标 /items/1 由 "y" 变为 "x" -> 同样 422
+curl -s -w '\nHTTP %{http_code}\n' -X POST localhost:8000/sessions/$SID/batches \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 0,
+       "operations": [{"actor":"alice","seq":1,"version":{"alice":1},
+                       "path":"/items","action":"insert","value":"A","index":0}]}'
+# => {"detail":"commit rejected: protected JSON Pointer '/items/1' changed"}
+# => HTTP 422
+
+# 把受保护字段设成它已有的值:生成新操作、修订照常递增,但文档未变 -> 200
+curl -s -X POST localhost:8000/sessions/$SID/batches \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 0,
+       "operations": [{"actor":"alice","seq":1,"version":{"alice":1},
+                       "path":"/title","action":"set","value":"draft"}]}'
+# => {"session_id":"...","revision":1,"accepted":1,"duplicates":0}
+```
+
+被保护规则拒绝的 JSONPath 批量替换（`/replace`）：
+
+```bash
+# $.items[*] 会把 /items/1 也改掉 -> 整次 422,不生成任何操作
+curl -s -w '\nHTTP %{http_code}\n' -X POST localhost:8000/sessions/$SID/replace \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 1, "actor": "bob", "path": "$.items[*]", "value": "z"}'
+# => {"detail":"commit rejected: protected JSON Pointer '/items/1' changed"}
+# => HTTP 422
+
+# 只替换未受保护的位置 -> 正常提交
+curl -s -X POST localhost:8000/sessions/$SID/replace \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 1, "actor": "bob", "path": "$.locked", "value": 1}'
+# => {"session_id":"...","revision":2,"matched_paths":["/locked"],
+#     "operations":[{"actor":"bob","seq":1,"path":"/locked"}]}
+
+# 规则在 GET 中随时可读,且重启 / 多进程共享目录后仍然生效
+curl -s localhost:8000/sessions/$SID
+# => {..."protected_paths":["/title","/items/1","/locked"]}
+```
+
 ### POST /sessions/{id}/changes —— 按修订号增量补读路由事件
 
 调用方分批提交后，用已读修订号作为游标补读每次实际生效的文档变更。
@@ -1035,6 +1128,7 @@ app/
   resolve.py   # 跨文档 $ref 物化：覆盖层合并、引用链循环检测、叶子来源映射
   sessions.py  # 分批会话：累计日志、不可变历史边界、跨进程原子提交（文件锁内校验+重算+边界+修订）、
                # JSONPath 批量替换（锁内选词+生成连续 set 操作+同一临界区提交）、
+               # 受保护 JSON Pointer（锁内逐条比较前后值，缺失/null、布尔/数字、祖先替换与数组位移均拦截）、
                # 增量修订补读（每次最多 20 条、游标分页）、旧会话历史起点迁移、JSON 文件持久化
 tests/
   test_api.py              # 22 个 merge/apply 端到端测试
@@ -1045,6 +1139,8 @@ tests/
   test_sessions.py         # 22 个分批会话端到端测试
   test_session_changes.py  # 27 个增量修订补读端到端测试（分页、不可变边界、旧会话迁移、持久化）
   test_session_replace.py  # 35 个 JSONPath 批量替换端到端测试（选词、连续编号、父子/超限 422、原子并发、历史）
+  test_protected_paths.py  # 53 个受保护 JSON Pointer 端到端测试（创建规则、缺失/null 与类型区分、
+                            # 祖先替换/数组位移拦截、批次与替换 422 不落盘、重传/409/零命中行为、旧会话与持久化）
 conftest.py
 Dockerfile
 docker-compose.yml

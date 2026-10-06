@@ -287,6 +287,13 @@ class SessionCreateRequest(BaseModel):
 
     The session pins both for its whole lifetime; every accepted batch is
     re-merged from this initial state over the cumulative operation log.
+
+    ``protected_paths`` optionally lists up to 20 distinct JSON Pointers
+    (RFC 6901) whose values must remain unchanged by every later commit
+    (``/batches`` and ``/replace``).  The rules are stored with the session
+    and never change after creation; a malformed pointer or a duplicated
+    entry rejects the whole request (422).  Sessions created before this
+    feature existed behave as if the list were empty.
     """
 
     document: Any = None
@@ -294,11 +301,60 @@ class SessionCreateRequest(BaseModel):
         default_factory=dict,
         description="version vector of the initial document",
     )
+    protected_paths: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        description=(
+            "up to 20 distinct JSON Pointers (RFC 6901) protected against "
+            "any value change for the session's lifetime; '' is the root"
+        ),
+    )
+
+    @field_validator("protected_paths")
+    @classmethod
+    def _check_protected_paths(cls, paths: list[str]) -> list[str]:
+        for pointer in paths:
+            _validate_pointer_syntax(pointer)
+        if len(set(paths)) != len(paths):
+            raise ValueError("protected_paths must not contain duplicates")
+        return paths
+
+
+def _validate_pointer_syntax(pointer: str) -> None:
+    """Validate the syntax of an RFC 6901 JSON Pointer.
+
+    ``""`` denotes the document root; every other pointer must start with
+    ``/`` and each ``~`` must be escaped as ``~0``/``~1``.  Array indices
+    are syntactically ordinary segments here (an out-of-range or
+    non-numeric segment simply resolves to a missing node at read time).
+    """
+    if pointer == "":
+        return
+    if not pointer.startswith("/"):
+        raise ValueError(
+            f"protected path {pointer!r} must be a JSON Pointer "
+            "(empty string for the root or starting with '/')"
+        )
+    for segment in pointer.split("/")[1:]:
+        i = 0
+        while i < len(segment):
+            if segment[i] == "~" and (
+                i + 1 >= len(segment) or segment[i + 1] not in "01"
+            ):
+                raise ValueError(
+                    f"protected path {pointer!r} is not a valid JSON Pointer: "
+                    "unescaped '~' (use '~0' for '~' and '~1' for '/')"
+                )
+            i += 1
 
 
 class SessionCreateResponse(BaseModel):
     session_id: str
     revision: int
+    protected_paths: list[str] = Field(
+        default_factory=list,
+        description="protected JSON Pointers stored with this session",
+    )
 
 
 class BatchRequest(BaseModel):
@@ -337,6 +393,10 @@ class SessionStateResponse(BaseModel):
     version: dict[str, int]
     conflicts: list[Conflict]
     tombstones: list[str]
+    protected_paths: list[str] = Field(
+        default_factory=list,
+        description="protected JSON Pointers pinned at session creation",
+    )
 
 
 # ---------------------------------------------------------------------------
