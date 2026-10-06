@@ -1,0 +1,19 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # session files live on the named volume below, so they survive
+      # `docker compose restart` / `down` + `up`
+      SESSION_STORE_DIR: /data/sessions
+    volumes:
+      - session-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  session-data:
